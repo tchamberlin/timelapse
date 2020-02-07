@@ -10,16 +10,17 @@ import shutil
 import subprocess
 import tempfile
 from pprint import pformat
-
+import re
 
 from dateutil import parser as dp
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
-
 
 # 2020-01-21_20-55-49_120
 THE_FORMAT = "%Y-%m-%d_%H-%M-%S_%f"
 
+FFMPEG_PROGRESS_REGEX = re.compile(r".+time=([\d:\.]+).+")
 
 def gen_description(stats, input_fps, playback_fps):
     description_lines = []
@@ -37,8 +38,8 @@ def gen_description(stats, input_fps, playback_fps):
 
     speedup = stats["speedup"]
     description_lines.append(
-        f"Timelapse images were taken at {stats['avg_delta']} intervals over "
-        f"{stats['total_length_weird']}. "
+        f"{stats['num_to_process']} timelapse images were taken at {stats['avg_delta']} intervals over "
+        f"{stats['total_length_to_process']}. "
         f"The resultant timelapse is {stats['timelapse_playback_time']} "
         f"({speedup:.2f}x real-time)."
     )
@@ -88,17 +89,28 @@ def format_td_verbose(td):
     return ", ".join(sections)
 
 
-def parse_image_path(path: Path):
-    return datetime.strptime(path.name.split(".")[0], THE_FORMAT)
+def parse_image_path(path: Path, the_format=None):
+    if the_format:
+        return datetime.strptime(".".join(path.name.split(".")[:-1]), the_format)
+    else:
+        return datetime.fromtimestamp(path.stat().st_mtime)
+
 
 
 def get_files_to_process(
-    input_glob, expected=60, margin=1, start=None, end=None, extended_stats=False
+    input_glob,
+    expected=5,
+    margin=1,
+    start=None,
+    end=None,
+    extended_stats=False,
+    time_format=THE_FORMAT,
 ):
-    paths = glob(input_glob)
+    input_path = os.path.expanduser(input_glob)
+    paths = glob(input_path)
     margin_td = timedelta(seconds=margin)
     expected_td = timedelta(seconds=expected)
-    paths = [Path(path) for path in paths]
+    paths = sorted([Path(path) for path in paths])
     paths_to_process = []
     total_gaps = timedelta(0)
     weird_length = timedelta(0)
@@ -124,13 +136,20 @@ def get_files_to_process(
     if start or end:
         logger.info(f"Keeping only images taken {filter_str}")
     for path, next_path in zip(paths, [*paths[1:], None]):
-        path_dt = parse_image_path(path)
+        if time_format:
+            path_dt = parse_image_path(path, time_format)
+        else:
+            path_dt = datetime.fromtimestamp(path.stat().st_mtime)
         if (start and path_dt < start) or (end and path_dt > end):
             num_filtered += 1
         else:
             paths_to_process.append(path)
             if next_path:
-                next_path_dt = parse_image_path(next_path)
+                if time_format:
+                    next_path_dt = parse_image_path(next_path, time_format)
+                else:
+                    next_path_dt = datetime.fromtimestamp(path.stat().st_mtime)
+
                 delta = next_path_dt - path_dt
                 if delta - expected_td > margin_td:
                     logger.warning(
@@ -146,12 +165,12 @@ def get_files_to_process(
         f"being taken outside bounds: {filter_str}"
     )
 
-    stats["total_length_with_gaps"] = parse_image_path(paths[-1]) - parse_image_path(
-        paths[0]
-    )
+    stats["total_length_with_gaps"] = parse_image_path(
+        paths[-1], time_format
+    ) - parse_image_path(paths[0], time_format)
     stats["total_length_to_process"] = parse_image_path(
-        paths_to_process[-1]
-    ) - parse_image_path(paths_to_process[0])
+        paths_to_process[-1], time_format
+    ) - parse_image_path(paths_to_process[0], time_format)
     stats["total_length_weird"] = weird_length
     stats["total_gaps"] = total_gaps
     stats["num_filtered"] = len(paths) - len(paths_to_process)
@@ -166,7 +185,7 @@ def get_files_to_process(
             path.stat().st_size for path in paths_to_process
         )
 
-    stats["avg_delta"] = stats["total_length_weird"] / stats["num_to_process"]
+    stats["avg_delta"] = stats["total_length_to_process"] / stats["num_to_process"]
     off_by = stats["avg_delta"] - expected_td
     if off_by > margin_td:
         logger.warning(
@@ -187,10 +206,11 @@ def make_symlinks(paths):
     return Path(tempdir)
 
 
-def timelapse(files_to_process, input_fps=30, output_fps=30, output_path="./out.mp4"):
+def timelapse(files_to_process, expected_playback_time, input_fps=30, output_fps=30, output_path="./out.mp4"):
     # ffmpeg is BAD at handling multiple input files. To get around this, we first create
     # a bunch of symlinks that are named in a way that ffmpeg understands
     tempdir = make_symlinks(files_to_process)
+    logger.debug(f"Made tmpdir {tempdir}")
 
     timelapse_cmd_list = [
         "ffmpeg",
@@ -199,35 +219,50 @@ def timelapse(files_to_process, input_fps=30, output_fps=30, output_path="./out.
         "-i",
         str(os.path.join(tempdir, r"%09d.jpg")),
         "-c:v",
-        "libx264",
+        # "libx264",
+        # webm
+        "libvpx",
+        # Sharpen output
+        "-crf",
+        "4",
+        # Set bitrate
+        "-b:v",
+        "2000K",
         "-r",
         str(output_fps),
-        "-pix_fmt",
-        "yuv420p",
-        "-filter:v",
-        f"crop={1182}:{666}:{243}:{0}",
+        # "-pix_fmt",
+        # "yuvj422p",
+        # Overwrite existing files
         "-y",
         str(output_path),
     ]
     # timelapse_cmd_list = ["cat"]
     logger.debug(f"Running: {' '.join(timelapse_cmd_list)}")
-    result = None
-    try:
-        result = subprocess.run(timelapse_cmd_list, check=True)
-    except subprocess.CalledProcessError as error:
-        logger.exception("ffmpeg error!")
-    except FileNotFoundError as error:
-        logger.exception("Failed to find ffmpeg in PATH (probably)!")
+    # result = None
+    cmd = subprocess.Popen(timelapse_cmd_list, universal_newlines=True, stderr=subprocess.PIPE)
+    progress = tqdm(total=expected_playback_time.total_seconds(), unit="output seconds")
+    for line in cmd.stderr:
+        if line.startswith("frame"):
+            match = FFMPEG_PROGRESS_REGEX.match(line)
+            if match:
+                hours, minutes, seconds = match.groups()[0].split(":")
+                hours = int(hours)
+                minutes = int(minutes)
+                seconds = float(seconds)
+                td = timedelta(hours=hours, minutes=minutes, seconds=seconds)
+                progress.n = td.total_seconds()
+                progress.refresh()
+        else:
+            # pass
+            logger.debug(line.rstrip())
 
-    if not result:
-        logger.error("Failed to execute ffmpeg! Continuing...")
     logger.debug(f"Removing temp dir {tempdir}")
     shutil.rmtree(tempdir)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("input")
+    parser.add_argument("input", type=Path)
     parser.add_argument("--output", type=Path, default="./timelapse.mp4")
 
     target_group = parser.add_mutually_exclusive_group(required=False)
@@ -256,6 +291,7 @@ def parse_args():
         type=dp.parse,
         help="If given, don't process any images taken after this date",
     )
+    parser.add_argument("--time-format", help="Format string sent to strptime")
     parser.add_argument("--extended-stats", action="store_true")
 
     parser.add_argument(
@@ -277,7 +313,11 @@ def main():
     else:
         init_logging(logging.INFO)
     files_to_process, stats = get_files_to_process(
-        args.input, start=args.start, end=args.end, extended_stats=args.extended_stats,
+        args.input.resolve(strict=False),
+        start=args.start,
+        end=args.end,
+        extended_stats=args.extended_stats,
+        time_format=args.time_format,
     )
 
     logger.debug(pformat(stats))
@@ -285,15 +325,16 @@ def main():
         input_fps = args.speedup / stats["avg_delta"].total_seconds()
     else:
         input_fps = args.input_fps
+
+
     timelapse_playback_time = timedelta(seconds=stats["num_to_process"] / input_fps)
     speedup = (
-        stats["total_length_weird"].total_seconds()
+        stats["total_length_to_process"].total_seconds()
         / timelapse_playback_time.total_seconds()
     )
     stats["timelapse_playback_time"] = timelapse_playback_time
     stats["speedup"] = speedup
 
-    # print("!", speedup / input_fps)
     print(gen_description(stats, input_fps, args.playback_fps))
     if not args.dry_run:
         timelapse(
@@ -301,6 +342,7 @@ def main():
             input_fps=input_fps,
             output_fps=args.playback_fps,
             output_path=args.output,
+            expected_playback_time=stats["timelapse_playback_time"]
         )
     else:
         logger.debug("Skipping timelapse processing due to presence of --dry-run")
