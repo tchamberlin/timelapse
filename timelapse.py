@@ -3,16 +3,23 @@
 from datetime import datetime, timedelta
 from glob import glob
 from pathlib import Path
+from pprint import pformat
 import argparse
+import contextlib
 import logging
 import os
-import shutil
-import subprocess
-import tempfile
-from pprint import pformat
+import os
 import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
 
 from dateutil import parser as dp
+import ffmpeg
+import gevent
+import gevent.monkey
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -21,6 +28,92 @@ logger = logging.getLogger(__name__)
 THE_FORMAT = "%Y-%m-%d_%H-%M-%S_%f"
 
 FFMPEG_PROGRESS_REGEX = re.compile(r".+time=([\d:\.]+).+")
+
+
+# TODO: Get rid of gevent and use threads?
+gevent.monkey.patch_all(thread=False)
+
+
+@contextlib.contextmanager
+def _tmpdir_scope():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        yield tmpdir
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def _do_watch_progress(filename, sock, handler):
+    """Function to run in a separate gevent greenlet to read progress
+    events from a unix-domain socket."""
+    connection, client_address = sock.accept()
+    data = b""
+    try:
+        while True:
+            more_data = connection.recv(16)
+            if not more_data:
+                break
+            data += more_data
+            lines = data.split(b"\n")
+            for line in lines[:-1]:
+                line = line.decode()
+                parts = line.split("=")
+                key = parts[0] if len(parts) > 0 else None
+                value = parts[1] if len(parts) > 1 else None
+                handler(key, value)
+            data = lines[-1]
+    finally:
+        connection.close()
+
+
+@contextlib.contextmanager
+def _watch_progress(handler):
+    """Context manager for creating a unix-domain socket and listen for
+    ffmpeg progress events.
+
+    The socket filename is yielded from the context manager and the
+    socket is closed when the context manager is exited.
+
+    Args:
+        handler: a function to be called when progress events are
+            received; receives a ``key`` argument and ``value``
+            argument. (The example ``show_progress`` below uses tqdm)
+
+    Yields:
+        socket_filename: the name of the socket file.
+    """
+    with _tmpdir_scope() as tmpdir:
+        socket_filename = os.path.join(tmpdir, "sock")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with contextlib.closing(sock):
+            sock.bind(socket_filename)
+            sock.listen(1)
+            child = gevent.spawn(_do_watch_progress, socket_filename, sock, handler)
+            try:
+                yield socket_filename
+            except:
+                gevent.kill(child)
+                raise
+
+
+@contextlib.contextmanager
+def show_progress(total_duration):
+    """Create a unix-domain socket to watch progress and render tqdm
+    progress bar."""
+    with tqdm(total=round(total_duration, 2)) as bar:
+
+        def handler(key, value):
+            if key == "out_time_ms":
+                time = round(float(value) / 1000000., 2)
+                if time < 0:
+                    time = 0
+                bar.update(time - bar.n)
+            elif key == "progress" and value == "end":
+                bar.update(bar.total - bar.n)
+
+        with _watch_progress(handler) as socket_filename:
+            yield socket_filename
+
 
 def gen_description(stats, input_fps, playback_fps):
     description_lines = []
@@ -94,7 +187,6 @@ def parse_image_path(path: Path, the_format=None):
         return datetime.strptime(".".join(path.name.split(".")[:-1]), the_format)
     else:
         return datetime.fromtimestamp(path.stat().st_mtime)
-
 
 
 def get_files_to_process(
@@ -211,64 +303,36 @@ def make_symlinks(paths, padding=9):
     return Path(tempdir), padding, suffixes.pop()
 
 
-def timelapse(files_to_process, expected_playback_time, input_fps=30, output_fps=30, output_path="./out.mp4"):
+def timelapse(
+    files_to_process,
+    expected_playback_time,
+    input_fps=30,
+    output_fps=30,
+    output_path="./out.mp4",
+):
     # ffmpeg is BAD at handling multiple input files. To get around this, we first create
     # a bunch of symlinks that are named in a way that ffmpeg understands
     tempdir, padding, suffix = make_symlinks(files_to_process)
     logger.debug(f"Made tmpdir {tempdir}")
-
-    timelapse_cmd_list = [
-        "ffmpeg",
-        "-framerate",
-        str(input_fps),
-        "-i",
-        str(os.path.join(tempdir, f"%0{padding}d{suffix}")),
-        "-filter:v",
-        # f"crop={1182}:{666}:{243}:{0},eq=saturation=2:contrast=1.07:brightness=0.05:gamma=0.9",
-        f"crop={1272}:{716}:{297}:{0},eq=saturation=1.8:contrast=1.03:brightness=0.02:gamma=0.9",
-        "-c:v",
-        "libx265",
-        # webm
-        # "libvpx",
-        # Sharpen output
-        # "-crf",
-        # "4",
-        # "-filter:v",
-        # "tblend",
-        # "-filter:v",
-        # "minterpolate",
-        # Set bitrate
-        # "-b:v",
-        # "2000K",
-        "-r",
-        str(output_fps),
-        "-pix_fmt",
-        "yuv420p",
-        # Overwrite existing files
-        "-y",
-        str(output_path),
-    ]
-    # timelapse_cmd_list = ["cat"]
-    logger.debug(f"Running: {' '.join(timelapse_cmd_list)}")
-    # result = None
-    cmd = subprocess.Popen(timelapse_cmd_list, universal_newlines=True, stderr=subprocess.PIPE)
-    progress = tqdm(total=expected_playback_time.total_seconds(), unit="output second")
-    # Examine each line of ffmpeg output (it all goes to stderr, for some reason):
-    for line in cmd.stderr:
-        # Lines that start with 'frame' are the "progress" lines
-        if line.startswith("frame"):
-            match = FFMPEG_PROGRESS_REGEX.match(line)
-            if match:
-                hours, minutes, seconds = match.groups()[0].split(":")
-                hours = int(hours)
-                minutes = int(minutes)
-                seconds = float(seconds)
-                td = timedelta(hours=hours, minutes=minutes, seconds=seconds)
-                progress.n = td.total_seconds()
-                progress.refresh()
-        else:
-            # pass
-            logger.debug(line.rstrip())
+    with show_progress(expected_playback_time.total_seconds()) as socket_filename:
+        try:
+            stdout, stderr = (
+                ffmpeg.input(
+                    str(os.path.join(tempdir, f"%0{padding}d{suffix}")),
+                    framerate=input_fps,
+                )
+                .crop(width=1272, height=716, x=297, y=0)
+                .filter("eq", saturation=1.8, contrast=1.03, brightness=0.02, gamma=0.9)
+                .output(
+                    str(output_path), r=output_fps, vcodec="libx265", pix_fmt="yuv420p"
+                )
+                .global_args("-progress", "unix://{}".format(socket_filename))
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True)
+            )
+        except ffmpeg.Error as e:
+            logger.exception(e.stderr.decode("utf-8"), file=sys.stderr)
+            sys.exit(1)
 
     logger.debug(f"Removing temp dir {tempdir}")
     shutil.rmtree(tempdir)
@@ -340,7 +404,6 @@ def main():
     else:
         input_fps = args.input_fps
 
-
     timelapse_playback_time = timedelta(seconds=stats["num_to_process"] / input_fps)
     speedup = (
         stats["total_length_to_process"].total_seconds()
@@ -356,7 +419,7 @@ def main():
             input_fps=input_fps,
             output_fps=args.playback_fps,
             output_path=args.output,
-            expected_playback_time=stats["timelapse_playback_time"]
+            expected_playback_time=stats["timelapse_playback_time"],
         )
     else:
         logger.debug("Skipping timelapse processing due to presence of --dry-run")
