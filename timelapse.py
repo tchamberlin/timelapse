@@ -196,20 +196,25 @@ def get_files_to_process(
     return paths_to_process, stats
 
 
-def make_symlinks(paths):
+def make_symlinks(paths, padding=9):
     logger.debug(f"Making symlinks...")
     tempdir = tempfile.mkdtemp()
+    suffixes = set()
     for i, path in enumerate(paths):
         path = Path(path)
-        os.symlink(path, Path(tempdir) / f"{i:09d}{path.suffix}")
+        suffixes.add(path.suffix)
+        os.symlink(path, Path(tempdir) / f"{i:0{padding}d}{path.suffix}")
     logger.debug(f"...done")
-    return Path(tempdir)
+
+    if len(suffixes) > 1:
+        raise ValueError(f"Multiple file suffixes found in input paths: {suffixes}")
+    return Path(tempdir), padding, suffixes.pop()
 
 
 def timelapse(files_to_process, expected_playback_time, input_fps=30, output_fps=30, output_path="./out.mp4"):
     # ffmpeg is BAD at handling multiple input files. To get around this, we first create
     # a bunch of symlinks that are named in a way that ffmpeg understands
-    tempdir = make_symlinks(files_to_process)
+    tempdir, padding, suffix = make_symlinks(files_to_process)
     logger.debug(f"Made tmpdir {tempdir}")
 
     timelapse_cmd_list = [
@@ -217,21 +222,28 @@ def timelapse(files_to_process, expected_playback_time, input_fps=30, output_fps
         "-framerate",
         str(input_fps),
         "-i",
-        str(os.path.join(tempdir, r"%09d.jpg")),
+        str(os.path.join(tempdir, f"%0{padding}d{suffix}")),
+        "-filter:v",
+        # f"crop={1182}:{666}:{243}:{0},eq=saturation=2:contrast=1.07:brightness=0.05:gamma=0.9",
+        f"crop={1272}:{716}:{297}:{0},eq=saturation=1.8:contrast=1.03:brightness=0.02:gamma=0.9",
         "-c:v",
-        # "libx264",
+        "libx265",
         # webm
-        "libvpx",
+        # "libvpx",
         # Sharpen output
-        "-crf",
-        "4",
+        # "-crf",
+        # "4",
+        # "-filter:v",
+        # "tblend",
+        # "-filter:v",
+        # "minterpolate",
         # Set bitrate
-        "-b:v",
-        "2000K",
+        # "-b:v",
+        # "2000K",
         "-r",
         str(output_fps),
-        # "-pix_fmt",
-        # "yuvj422p",
+        "-pix_fmt",
+        "yuv420p",
         # Overwrite existing files
         "-y",
         str(output_path),
@@ -240,8 +252,10 @@ def timelapse(files_to_process, expected_playback_time, input_fps=30, output_fps
     logger.debug(f"Running: {' '.join(timelapse_cmd_list)}")
     # result = None
     cmd = subprocess.Popen(timelapse_cmd_list, universal_newlines=True, stderr=subprocess.PIPE)
-    progress = tqdm(total=expected_playback_time.total_seconds(), unit="output seconds")
+    progress = tqdm(total=expected_playback_time.total_seconds(), unit="output second")
+    # Examine each line of ffmpeg output (it all goes to stderr, for some reason):
     for line in cmd.stderr:
+        # Lines that start with 'frame' are the "progress" lines
         if line.startswith("frame"):
             match = FFMPEG_PROGRESS_REGEX.match(line)
             if match:
@@ -313,7 +327,7 @@ def main():
     else:
         init_logging(logging.INFO)
     files_to_process, stats = get_files_to_process(
-        args.input.resolve(strict=False),
+        args.input,
         start=args.start,
         end=args.end,
         extended_stats=args.extended_stats,
