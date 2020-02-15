@@ -11,7 +11,12 @@ import subprocess
 import tempfile
 from pprint import pformat
 import re
+import sys
+import pytz
 
+from PIL import Image
+from PIL import ImageFont
+from PIL import ImageDraw
 from dateutil import parser as dp
 from tqdm import tqdm
 
@@ -21,6 +26,7 @@ logger = logging.getLogger(__name__)
 THE_FORMAT = "%Y-%m-%d_%H-%M-%S_%f"
 
 FFMPEG_PROGRESS_REGEX = re.compile(r".+time=([\d:\.]+).+")
+
 
 def gen_description(stats, input_fps, playback_fps):
     description_lines = []
@@ -89,22 +95,27 @@ def format_td_verbose(td):
     return ", ".join(sections)
 
 
-def parse_image_path(path: Path, the_format=None):
+def parse_image_path(path: Path, the_format=None, tz=pytz.timezone("America/New_York")):
     if the_format:
-        return datetime.strptime(".".join(path.name.split(".")[:-1]), the_format)
+        dt = datetime.strptime(".".join(path.name.split(".")[:-1]), the_format)
     else:
-        return datetime.fromtimestamp(path.stat().st_mtime)
+        dt = datetime.fromtimestamp(path.stat().st_mtime)
 
+    if tz:
+        return tz.localize(dt)
+    else:
+        return dt
 
 
 def get_files_to_process(
     input_glob,
-    expected=5,
+    expected=60,
     margin=1,
     start=None,
     end=None,
     extended_stats=False,
     time_format=THE_FORMAT,
+    no_progress=False,
 ):
     input_path = os.path.expanduser(input_glob)
     paths = glob(input_path)
@@ -113,7 +124,6 @@ def get_files_to_process(
     paths = sorted([Path(path) for path in paths])
     paths_to_process = []
     total_gaps = timedelta(0)
-    weird_length = timedelta(0)
 
     start_filter_str = f"after {start}"
     end_filter_str = f"before {end}"
@@ -135,7 +145,9 @@ def get_files_to_process(
     deltas = []
     if start or end:
         logger.info(f"Keeping only images taken {filter_str}")
-    for path, next_path in zip(paths, [*paths[1:], None]):
+    for path, next_path in tqdm(
+        zip(paths, [*paths[1:], None]), unit="file", disable=no_progress
+    ):
         if time_format:
             path_dt = parse_image_path(path, time_format)
         else:
@@ -156,8 +168,7 @@ def get_files_to_process(
                         f"Gap of >{margin_td} between {Path(path).name} and {Path(next_path).name}: {delta}"
                     )
                     total_gaps += delta
-                else:
-                    weird_length += delta
+                # else:
                 deltas.append(delta)
 
     logger.debug(
@@ -171,7 +182,6 @@ def get_files_to_process(
     stats["total_length_to_process"] = parse_image_path(
         paths_to_process[-1], time_format
     ) - parse_image_path(paths_to_process[0], time_format)
-    stats["total_length_weird"] = weird_length
     stats["total_gaps"] = total_gaps
     stats["num_filtered"] = len(paths) - len(paths_to_process)
     stats["num_to_process"] = len(paths_to_process)
@@ -196,6 +206,43 @@ def get_files_to_process(
     return paths_to_process, stats
 
 
+def edit_image(in_path, out_path, tz_name=None):
+    img = Image.open(in_path)
+    img = img.crop((297, 0, 1272 + 297, 716))
+    draw = ImageDraw.Draw(img)
+    # font = ImageFont.truetype(<font-file>, <font-size>)
+    font = ImageFont.truetype("LiberationSans-Regular.ttf", 24)
+    # font = ImageFont.load_default()
+    # draw.text((x, y),"Sample Text",(r,g,b))
+    timestamp = parse_image_path(in_path, the_format=THE_FORMAT)
+    # if timestamp.tzinfo:
+    #     timestr = timestamp.strftime("%Y-%m-%d %H:%M %z")
+    # else:
+    #     timestr = timestamp.strftime("%Y-%m-%d %H:%M")
+    timestr = timestamp.strftime("%Y-%m-%d %H:%M")
+    # logger.debug(f"Copy from {in_path} to {out_path}")
+    draw.rectangle((0, 690, 200, 716), fill=(0, 0, 0))
+    draw.text((5, 690), timestr, (255, 255, 255), font=font)
+
+    img.save(out_path)
+
+
+def edit_images(paths, output_dir, padding=9, skip_exists=True, no_progress=False):
+    logger.info(f"Copying/modifying input images to {output_dir}...")
+    suffixes = set()
+    for i, input_path in enumerate(tqdm(paths, unit="file", disable=no_progress)):
+        output_path = output_dir / f"{i:0{padding}d}{input_path.suffix}"
+        if not (skip_exists and output_path.exists()):
+            edit_image(input_path, output_path)
+        suffixes.add(input_path.suffix)
+
+    if len(suffixes) > 1:
+        raise ValueError(f"Multiple file suffixes found in input paths: {suffixes}")
+
+    logger.info("...done")
+    return suffixes.pop()
+
+
 def make_symlinks(paths, padding=9):
     logger.debug(f"Making symlinks...")
     tempdir = tempfile.mkdtemp()
@@ -211,21 +258,40 @@ def make_symlinks(paths, padding=9):
     return Path(tempdir), padding, suffixes.pop()
 
 
-def timelapse(files_to_process, expected_playback_time, input_fps=30, output_fps=30, output_path="./out.mp4"):
-    # ffmpeg is BAD at handling multiple input files. To get around this, we first create
-    # a bunch of symlinks that are named in a way that ffmpeg understands
-    tempdir, padding, suffix = make_symlinks(files_to_process)
-    logger.debug(f"Made tmpdir {tempdir}")
+def timelapse(
+    files_to_process,
+    expected_playback_time,
+    input_fps=30,
+    output_fps=30,
+    output_path="./out.mp4",
+    staging_path=Path("./staging"),
+    no_progress=False,
+    no_edit=False,
+):
+
+    if no_edit:
+        # ffmpeg is BAD at handling multiple input files. To get around this, we first create
+        # a bunch of symlinks that are named in a way that ffmpeg understands
+        staging_path, padding, suffix = make_symlinks(files_to_process[:120])
+        logger.debug(f"Made tmpdir {staging_path}")
+    else:
+        staging_path.mkdir(exist_ok=True, parents=True)
+        padding = 9
+        suffix = edit_images(
+            files_to_process,
+            output_dir=staging_path,
+            padding=padding,
+            no_progress=no_progress,
+        )
 
     timelapse_cmd_list = [
         "ffmpeg",
         "-framerate",
         str(input_fps),
         "-i",
-        str(os.path.join(tempdir, f"%0{padding}d{suffix}")),
+        str(os.path.join(staging_path, f"%0{padding}d{suffix}")),
         "-filter:v",
-        # f"crop={1182}:{666}:{243}:{0},eq=saturation=2:contrast=1.07:brightness=0.05:gamma=0.9",
-        f"crop={1272}:{716}:{297}:{0},eq=saturation=1.8:contrast=1.03:brightness=0.02:gamma=0.9",
+        f"eq=saturation=1.8:contrast=1.03:brightness=0.02:gamma=0.9",
         "-c:v",
         "libx265",
         # webm
@@ -251,8 +317,14 @@ def timelapse(files_to_process, expected_playback_time, input_fps=30, output_fps
     # timelapse_cmd_list = ["cat"]
     logger.debug(f"Running: {' '.join(timelapse_cmd_list)}")
     # result = None
-    cmd = subprocess.Popen(timelapse_cmd_list, universal_newlines=True, stderr=subprocess.PIPE)
-    progress = tqdm(total=expected_playback_time.total_seconds(), unit="output second")
+    cmd = subprocess.Popen(
+        timelapse_cmd_list, universal_newlines=True, stderr=subprocess.PIPE
+    )
+    progress = tqdm(
+        total=expected_playback_time.total_seconds(),
+        unit="output second",
+        disable=no_progress,
+    )
     # Examine each line of ffmpeg output (it all goes to stderr, for some reason):
     for line in cmd.stderr:
         # Lines that start with 'frame' are the "progress" lines
@@ -267,11 +339,11 @@ def timelapse(files_to_process, expected_playback_time, input_fps=30, output_fps
                 progress.n = td.total_seconds()
                 progress.refresh()
         else:
-            # pass
             logger.debug(line.rstrip())
 
-    logger.debug(f"Removing temp dir {tempdir}")
-    shutil.rmtree(tempdir)
+    if no_edit:
+        logger.debug(f"Removing temp dir {tempdir}")
+        shutil.rmtree(tempdir)
 
 
 def parse_args():
@@ -317,6 +389,11 @@ def parse_args():
     parser.add_argument(
         "-D", "--dry-run", action="store_true", help="Don't make any changes"
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="No progress bars (useful for cron scripts, etc.)",
+    )
     return parser.parse_args()
 
 
@@ -326,20 +403,22 @@ def main():
         init_logging(logging.DEBUG)
     else:
         init_logging(logging.INFO)
+    logger.debug("Determining files to process...")
     files_to_process, stats = get_files_to_process(
         args.input,
         start=args.start,
         end=args.end,
         extended_stats=args.extended_stats,
         time_format=args.time_format,
+        no_progress=args.no_progress,
     )
+    logger.debug("...done")
 
     logger.debug(pformat(stats))
     if args.speedup:
         input_fps = args.speedup / stats["avg_delta"].total_seconds()
     else:
         input_fps = args.input_fps
-
 
     timelapse_playback_time = timedelta(seconds=stats["num_to_process"] / input_fps)
     speedup = (
@@ -356,18 +435,34 @@ def main():
             input_fps=input_fps,
             output_fps=args.playback_fps,
             output_path=args.output,
-            expected_playback_time=stats["timelapse_playback_time"]
+            expected_playback_time=stats["timelapse_playback_time"],
+            no_progress=args.no_progress,
         )
     else:
         logger.debug("Skipping timelapse processing due to presence of --dry-run")
+
+
+class TqdmLoggingHandler(logging.Handler):
+    def __init__(self, level=logging.NOTSET):
+        super(self.__class__, self).__init__(level)
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg, file=sys.stderr)
+            # self.flush()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except:
+            self.handleError(record)
 
 
 def init_logging(level):
     """Initialize logging"""
     logging.getLogger().setLevel(level)
     _logger = logging.getLogger(__name__)
-    # console_handler = TqdmLoggingHandler()
-    console_handler = logging.StreamHandler()
+    console_handler = TqdmLoggingHandler()
+    # console_handler = logging.StreamHandler()
     console_handler.setFormatter(logging.Formatter("%(message)s"))
     _logger.addHandler(console_handler)
     _logger.setLevel(level)
