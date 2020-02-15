@@ -12,6 +12,7 @@ import tempfile
 from pprint import pformat
 import re
 import sys
+import shlex
 import pytz
 
 from PIL import Image
@@ -180,9 +181,7 @@ def get_files_to_process(
                     total_gaps += delta
                 deltas.append(delta)
 
-    logger.debug(
-        f"{num_filtered} images were filtered out due to given time filter(s)"
-    )
+    logger.debug(f"{num_filtered} images were filtered out due to given time filter(s)")
 
     stats["total_length_with_gaps"] = parse_image_path(
         paths[-1], time_format
@@ -238,95 +237,60 @@ def edit_image(in_path, out_path, tz=None):
 
 
 def edit_images(
-    paths, output_dir, padding=9, skip_exists=True, no_progress=False, tz=None
+    paths,
+    output_dir,
+    padding=9,
+    skip_exists=True,
+    no_progress=False,
+    tz=None,
+    dry_run=False,
 ):
-    logger.info(f"Copying/modifying input images to {output_dir}...")
-    suffixes = set()
-    for i, input_path in enumerate(tqdm(paths, unit="file", disable=no_progress)):
-        output_path = output_dir / f"{i:0{padding}d}{input_path.suffix}"
+    skipped_count = 0
+    if dry_run:
+        logger.info("Skipping file copying/editing due to dry_run=True")
+    else:
+        logger.info(f"Copying/modifying input images to {output_dir}...")
+    skipped = []
+    # Need miniters to avoid 10 sec lag after a bunch of files are skipped
+    progress = tqdm(paths, unit="file", disable=no_progress, miniters=1)
+    for input_path in progress:
+        output_path = output_dir / input_path.name
         if not (skip_exists and output_path.exists()):
-            edit_image(input_path, output_path, tz=tz)
-        suffixes.add(input_path.suffix)
+            # If we are doing a copy, AND we have previously skipped at least 1 file, print a summary
+            # of how many were skipped total
+            if skipped_count > 0:
+                logger.debug(f"Skipped {skipped_count} images (already exist!)")
+            if not dry_run:
+                edit_image(input_path, output_path, tz=tz)
+            skipped_count = 0
+        else:
+            skipped.append(output_path)
+            skipped_count += 1
+        progress.set_description(output_path.name)
 
-    if len(suffixes) > 1:
-        raise ValueError(f"Multiple file suffixes found in input paths: {suffixes}")
-
-    logger.info("...done")
-    return suffixes.pop()
+    return skipped
 
 
-def make_symlinks(paths, padding=9):
-    logger.debug(f"Making symlinks...")
+def make_symlinks(paths, padding=9, dry_run=False):
+
+    if dry_run:
+        logger.debug(f"Skipping symlink creation due to dry_run=True")
+    else:
+        logger.debug(f"Making symlinks...")
     tempdir = tempfile.mkdtemp()
     suffixes = set()
     for i, path in enumerate(paths):
         path = Path(path)
         suffixes.add(path.suffix)
-        os.symlink(path, Path(tempdir) / f"{i:0{padding}d}{path.suffix}")
-    logger.debug(f"...done")
+        if not dry_run:
+            os.symlink(path, Path(tempdir) / f"{i:0{padding}d}{path.suffix}")
 
     if len(suffixes) > 1:
         raise ValueError(f"Multiple file suffixes found in input paths: {suffixes}")
     return Path(tempdir), padding, suffixes.pop()
 
 
-def timelapse(
-    files_to_process,
-    expected_playback_time,
-    input_fps=30,
-    output_fps=30,
-    output_path="./out.mp4",
-    staging_path=Path("./staging"),
-    no_progress=False,
-    no_edit=False,
-):
-
-    if no_edit:
-        # ffmpeg is BAD at handling multiple input files. To get around this, we first create
-        # a bunch of symlinks that are named in a way that ffmpeg understands
-        staging_path, padding, suffix = make_symlinks(files_to_process)
-        logger.debug(f"Made tmpdir {staging_path}")
-    else:
-        staging_path.mkdir(exist_ok=True, parents=True)
-        padding = 9
-        suffix = edit_images(
-            files_to_process,
-            output_dir=staging_path,
-            padding=padding,
-            no_progress=no_progress,
-            # tz="ET"
-        )
-
-    timelapse_cmd_list = [
-        "ffmpeg",
-        "-framerate",
-        str(input_fps),
-        "-i",
-        str(os.path.join(staging_path, f"%0{padding}d{suffix}")),
-        "-filter:v",
-        f"eq=saturation=1.8:contrast=1.03:brightness=0.02:gamma=0.9",
-        "-c:v",
-        "libx265",
-        # webm
-        # "libvpx",
-        # Sharpen output
-        # "-crf",
-        # "4",
-        # "-filter:v",
-        # "tblend",
-        # "-filter:v",
-        # "minterpolate",
-        # Set bitrate
-        # "-b:v",
-        # "2000K",
-        "-r",
-        str(output_fps),
-        "-pix_fmt",
-        "yuv420p",
-        # Overwrite existing files
-        "-y",
-        str(output_path),
-    ]
+def do_ffmpeg(timelapse_cmd_list, expected_playback_time, no_progress=False):
     logger.debug(f"Running: {' '.join(timelapse_cmd_list)}")
     cmd = subprocess.Popen(
         timelapse_cmd_list, universal_newlines=True, stderr=subprocess.PIPE
@@ -352,9 +316,87 @@ def timelapse(
         else:
             logger.debug(line.rstrip())
 
+
+def timelapse(
+    files_to_process,
+    expected_playback_time,
+    input_fps=30,
+    output_fps=30,
+    output_path="./out.mp4",
+    staging_path=Path("./staging"),
+    no_progress=False,
+    no_edit=False,
+    dry_run=False,
+):
     if no_edit:
-        logger.debug(f"Removing temp dir {staging_path}")
-        shutil.rmtree(staging_path)
+        logger.debug("Skipping image editing...")
+        files_to_make_symlinks_to = files_to_process
+    else:
+        if not dry_run:
+            staging_path.mkdir(exist_ok=True, parents=True)
+        else:
+            logger.debug(f"Skipping creation of {staging_path} due to --dry-run")
+        padding = 9
+        skipped = edit_images(
+            files_to_process,
+            output_dir=staging_path,
+            padding=padding,
+            no_progress=no_progress,
+            dry_run=dry_run
+            # tz="ET"
+        )
+        files_to_make_symlinks_to = staging_path.iterdir()
+
+    if dry_run:
+        logger.debug(
+            f"Would have skipped copying {len(skipped)} files (but nothing happened due to dry_run=True"
+        )
+    else:
+        logger.debug(f"Skipped copying {len(skipped)} files")
+
+    # ffmpeg is BAD at handling multiple input files. To get around this, we first create
+    # a bunch of symlinks that are named in a way that ffmpeg understands
+    tempdir, padding, suffix = make_symlinks(files_to_make_symlinks_to, dry_run=dry_run)
+    if not dry_run:
+        logger.debug(f"Made tempdir {tempdir}")
+    timelapse_cmd_list = [
+        "ffmpeg",
+        "-framerate",
+        str(input_fps),
+        "-i",
+        str(os.path.join(tempdir, f"%0{padding}d{suffix}")),
+        "-filter:v",
+        f"eq=saturation=1.8:contrast=1.03:brightness=0.02:gamma=0.9",
+        "-c:v",
+        "libx265",
+        # webm
+        # "libvpx",
+        # Sharpen output
+        # "-crf",
+        # "4",
+        # "-filter:v",
+        # "tblend",
+        # "-filter:v",
+        # "minterpolate",
+        # Set bitrate
+        # "-b:v",
+        # "2000K",
+        "-r",
+        str(output_fps),
+        "-pix_fmt",
+        "yuv420p",
+        # Overwrite existing files
+        "-y",
+        str(output_path),
+    ]
+    if dry_run:
+        logger.debug(f"Would execute: {shlex.quote(' '.join(timelapse_cmd_list))}")
+    else:
+        do_ffmpeg(timelapse_cmd_list, expected_playback_time, no_progress=no_progress)
+
+    if not dry_run:
+        logger.debug(f"Removing temp dir {tempdir}")
+        shutil.rmtree(tempdir)
 
 
 def parse_args():
@@ -448,17 +490,15 @@ def main():
     stats["speedup"] = speedup
 
     print(gen_description(stats, input_fps, args.playback_fps))
-    if not args.dry_run:
-        timelapse(
-            files_to_process,
-            input_fps=input_fps,
-            output_fps=args.playback_fps,
-            output_path=args.output,
-            expected_playback_time=stats["timelapse_playback_time"],
-            no_progress=args.no_progress,
-        )
-    else:
-        logger.debug("Skipping timelapse processing due to presence of --dry-run")
+    timelapse(
+        files_to_process,
+        input_fps=input_fps,
+        output_fps=args.playback_fps,
+        output_path=args.output,
+        expected_playback_time=stats["timelapse_playback_time"],
+        no_progress=args.no_progress,
+        dry_run=args.dry_run,
+    )
 
 
 class TqdmLoggingHandler(logging.Handler):
