@@ -95,16 +95,13 @@ def format_td_verbose(td):
     return ", ".join(sections)
 
 
-def parse_image_path(path: Path, the_format=None, tz=pytz.timezone("America/New_York")):
+def parse_image_path(path: Path, the_format=None, tz=None):
     if the_format:
         dt = datetime.strptime(".".join(path.name.split(".")[:-1]), the_format)
     else:
         dt = datetime.fromtimestamp(path.stat().st_mtime)
 
-    if tz:
-        return tz.localize(dt)
-    else:
-        return dt
+    return dt
 
 
 def get_files_to_process(
@@ -114,8 +111,10 @@ def get_files_to_process(
     start=None,
     end=None,
     extended_stats=False,
+    timestamp_source="filename",
     time_format=THE_FORMAT,
     no_progress=False,
+    tz=pytz.timezone("America/New_York"),
 ):
     input_path = os.path.expanduser(input_glob)
     paths = glob(input_path)
@@ -143,21 +142,32 @@ def get_files_to_process(
         "end_filter": end,
     }
     deltas = []
+    if timestamp_source == "filename":
+        if time_format is None:
+            raise ValueError("If timestamp_source is filename, must give time_format!")
+        logger.debug(
+            f"Parsing image file timestamps using timestamp format {time_format}"
+        )
+    else:
+        logger.debug(f"Parsing image file timestamps using file modification times")
+
     if start or end:
         logger.info(f"Keeping only images taken {filter_str}")
     for path, next_path in tqdm(
         zip(paths, [*paths[1:], None]), unit="file", disable=no_progress
     ):
-        if time_format:
+        if timestamp_source == "filename":
             path_dt = parse_image_path(path, time_format)
         else:
             path_dt = datetime.fromtimestamp(path.stat().st_mtime)
+
         if (start and path_dt < start) or (end and path_dt > end):
+            # logger.debug(f"Filtered {path}")
             num_filtered += 1
         else:
             paths_to_process.append(path)
             if next_path:
-                if time_format:
+                if timestamp_source == "filename":
                     next_path_dt = parse_image_path(next_path, time_format)
                 else:
                     next_path_dt = datetime.fromtimestamp(path.stat().st_mtime)
@@ -168,12 +178,10 @@ def get_files_to_process(
                         f"Gap of >{margin_td} between {Path(path).name} and {Path(next_path).name}: {delta}"
                     )
                     total_gaps += delta
-                # else:
                 deltas.append(delta)
 
     logger.debug(
-        f"{num_filtered} images were filtered out due to "
-        f"being taken outside bounds: {filter_str}"
+        f"{num_filtered} images were filtered out due to given time filter(s)"
     )
 
     stats["total_length_with_gaps"] = parse_image_path(
@@ -206,7 +214,7 @@ def get_files_to_process(
     return paths_to_process, stats
 
 
-def edit_image(in_path, out_path, tz_name=None):
+def edit_image(in_path, out_path, tz=None):
     img = Image.open(in_path)
     img = img.crop((297, 0, 1272 + 297, 716))
     draw = ImageDraw.Draw(img)
@@ -220,6 +228,8 @@ def edit_image(in_path, out_path, tz_name=None):
     # else:
     #     timestr = timestamp.strftime("%Y-%m-%d %H:%M")
     timestr = timestamp.strftime("%Y-%m-%d %H:%M")
+    if tz:
+        timestr = f"{timestr} {tz}"
     # logger.debug(f"Copy from {in_path} to {out_path}")
     draw.rectangle((0, 690, 200, 716), fill=(0, 0, 0))
     draw.text((5, 690), timestr, (255, 255, 255), font=font)
@@ -227,13 +237,15 @@ def edit_image(in_path, out_path, tz_name=None):
     img.save(out_path)
 
 
-def edit_images(paths, output_dir, padding=9, skip_exists=True, no_progress=False):
+def edit_images(
+    paths, output_dir, padding=9, skip_exists=True, no_progress=False, tz=None
+):
     logger.info(f"Copying/modifying input images to {output_dir}...")
     suffixes = set()
     for i, input_path in enumerate(tqdm(paths, unit="file", disable=no_progress)):
         output_path = output_dir / f"{i:0{padding}d}{input_path.suffix}"
         if not (skip_exists and output_path.exists()):
-            edit_image(input_path, output_path)
+            edit_image(input_path, output_path, tz=tz)
         suffixes.add(input_path.suffix)
 
     if len(suffixes) > 1:
@@ -272,7 +284,7 @@ def timelapse(
     if no_edit:
         # ffmpeg is BAD at handling multiple input files. To get around this, we first create
         # a bunch of symlinks that are named in a way that ffmpeg understands
-        staging_path, padding, suffix = make_symlinks(files_to_process[:120])
+        staging_path, padding, suffix = make_symlinks(files_to_process)
         logger.debug(f"Made tmpdir {staging_path}")
     else:
         staging_path.mkdir(exist_ok=True, parents=True)
@@ -282,6 +294,7 @@ def timelapse(
             output_dir=staging_path,
             padding=padding,
             no_progress=no_progress,
+            # tz="ET"
         )
 
     timelapse_cmd_list = [
@@ -314,9 +327,7 @@ def timelapse(
         "-y",
         str(output_path),
     ]
-    # timelapse_cmd_list = ["cat"]
     logger.debug(f"Running: {' '.join(timelapse_cmd_list)}")
-    # result = None
     cmd = subprocess.Popen(
         timelapse_cmd_list, universal_newlines=True, stderr=subprocess.PIPE
     )
@@ -342,8 +353,8 @@ def timelapse(
             logger.debug(line.rstrip())
 
     if no_edit:
-        logger.debug(f"Removing temp dir {tempdir}")
-        shutil.rmtree(tempdir)
+        logger.debug(f"Removing temp dir {staging_path}")
+        shutil.rmtree(staging_path)
 
 
 def parse_args():
@@ -377,7 +388,14 @@ def parse_args():
         type=dp.parse,
         help="If given, don't process any images taken after this date",
     )
-    parser.add_argument("--time-format", help="Format string sent to strptime")
+    parser.add_argument(
+        "--timestamp-source", choices=("metadata", "filename"), default="filename"
+    )
+    parser.add_argument(
+        "--time-format",
+        default=THE_FORMAT,
+        help="Format string sent to strptime (default: %(default)s)",
+    )
     parser.add_argument("--extended-stats", action="store_true")
 
     parser.add_argument(
@@ -409,6 +427,7 @@ def main():
         start=args.start,
         end=args.end,
         extended_stats=args.extended_stats,
+        timestamp_source=args.timestamp_source,
         time_format=args.time_format,
         no_progress=args.no_progress,
     )
