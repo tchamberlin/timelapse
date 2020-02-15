@@ -31,11 +31,11 @@ FFMPEG_PROGRESS_REGEX = re.compile(r".+time=([\d:\.]+).+")
 def gen_description(stats, input_fps, playback_fps):
     description_lines = []
 
-    # description_lines.append(f"Total gaps remaining: {stats['total_gaps']}")
-    # description_lines.append(
-    #     f"Num images filtered out: {stats['num_filtered']}/{stats['total_processed']} "
-    #     f"({stats['percent_filtered']:.2%})"
-    # )
+    description_lines.append(f"Total gaps remaining: {stats['total_gaps']}")
+    description_lines.append(
+        f"Num images filtered out: {stats['num_filtered']}/{stats['total_processed']} "
+        f"({stats['percent_filtered']:.2%})"
+    )
     if "total_size_to_process" in stats:
         description_lines.append(
             f"{stats['total_size_to_process'] / (1 << 30):.2f} "
@@ -433,7 +433,7 @@ def main():
     )
     logger.debug("...done")
 
-    logger.debug(pformat(stats))
+    # logger.debug(pformat(stats))
     if args.speedup:
         input_fps = args.speedup / stats["avg_delta"].total_seconds()
     else:
